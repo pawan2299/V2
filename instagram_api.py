@@ -11,15 +11,22 @@ TIMEOUT = 10
 
 def _post(endpoint: str, data: dict, token: str) -> bool:
     """Instagram Graph API POST — clean wrapper."""
-    data["access_token"] = token
     try:
-        resp = requests.post(f"{BASE}/{endpoint}", json=data, timeout=TIMEOUT)
+        resp = requests.post(
+            f"{BASE}/{endpoint}",
+            params={"access_token": token},
+            json=data,
+            timeout=TIMEOUT
+        )
+
         if resp.ok:
             return True
-        logger.error(f"Instagram API error {resp.status_code}: {resp.text[:200]}")
+
+        logger.error("Instagram API error %s: %s", resp.status_code, resp.text)
         return False
-    except requests.RequestException as e:
-        logger.error(f"Instagram request failed: {e}")
+
+    except requests.RequestException:
+        logger.exception("Instagram request failed")
         return False
 
 
@@ -30,6 +37,9 @@ def reply_to_comment(comment_id: str, message: str) -> bool:
 
 def send_dm(user_id: str, message: str) -> bool:
     # DMs/Messaging requires Page Access Token
+    logger.info("DM target user_id=%s", user_id)
+    logger.info("DM message=%s", message)
+
     return _post(
         f"{SETTINGS.page_id}/messages",
         {
@@ -54,6 +64,8 @@ def get_media_url(media_id: str) -> str | None:
         )
         if resp.ok:
             return resp.json().get("media_url")
+        
+        logger.error("Failed to fetch media_url %s: %s", resp.status_code, resp.text)
         return None
     except Exception as e:
         logger.error(f"Failed to fetch media_url: {e}")
@@ -66,6 +78,8 @@ def check_token_validity(token_type: str = "ig_user") -> bool:
     """
     token = SETTINGS.ig_user_token if token_type == "ig_user" else SETTINGS.page_access_token
     try:
+        # Note: Ideally debug_token should use an APP ACCESS TOKEN as the 'access_token' param
+        # but using the token itself often works for basic validation.
         resp = requests.get(
             "https://graph.facebook.com/debug_token",
             params={
@@ -75,7 +89,7 @@ def check_token_validity(token_type: str = "ig_user") -> bool:
             timeout=10
         )
         if not resp.ok:
-            logger.error(f"{token_type} Token debug failed: {resp.text[:200]}")
+            logger.error(f"{token_type} Token debug failed {resp.status_code}: {resp.text}")
             return False
 
         data = resp.json().get("data", {})
