@@ -3,9 +3,15 @@ import logging
 import time
 from collections import deque
 from datetime import date
+import random
 from google import genai
+from google.genai import types
 from config import SETTINGS
-from database import increment_gemini_count, get_state, set_state
+from database import (
+    increment_gemini_count, get_state, set_state, 
+    is_model_on_cooldown, set_model_cooldown,
+    get_recent_replies, add_recent_reply
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,31 +87,49 @@ def _increment_model_rpd(model_id: str) -> int:
     return count
 
 
-def _get_best_model() -> str | None:
-    """Priority order में best available model चुनो।"""
+def _get_best_model(task_type: str = "comment") -> str | None:
+    """
+    Priority order में best available model चुनो।
+    Task-based routing & Quota smoothing added.
+    """
     now = time.time()
+    
+    # Task-based preference
+    preferred_models = [m["id"] for m in MODEL_CONFIGS]
+    if task_type == "dm":
+        # Put high quality first for DMs
+        preferred_models = ["gemini-2.5-flash"] + [m for m in preferred_models if m != "gemini-2.5-flash"]
+    elif task_type == "spam":
+        # Put fast/fallback first for spam checks
+        preferred_models = ["gemma-4-27b"] + [m for m in preferred_models if m != "gemma-4-27b"]
 
-    for model in MODEL_CONFIGS:
-        mid = model["id"]
+    for mid in preferred_models:
+        model = next(m for m in MODEL_CONFIGS if m["id"] == mid)
+        
+        # Cooldown check
+        if is_model_on_cooldown(mid):
+            continue
+
+        # Quota Smoothing: Only use best model for 20% of comments if task is 'comment'
+        if mid == "gemini-2.5-flash" and task_type == "comment":
+            if random.random() > 0.2:
+                continue
 
         # RPM check
         calls = _model_rpm_calls[mid]
         while calls and now - calls[0] > 60:
             calls.popleft()
         if len(calls) >= model["rpm"]:
-            logger.debug(f"{mid}: RPM limit ({len(calls)}/{model['rpm']})")
             continue
 
         # RPD check
         today_count = _get_model_rpd_today(mid)
         if today_count >= model["rpd"]:
-            logger.debug(f"{mid}: RPD limit ({today_count}/{model['rpd']})")
             continue
 
-        logger.debug(f"Model selected: {mid} | Today: {today_count}/{model['rpd']}")
         return mid
 
-    return None  # सब exhaust
+    return preferred_models[0] if preferred_models else None # Absolute fallback
 
 
 def _record_call(model_id: str):
@@ -175,54 +199,100 @@ def can_use_gemini() -> bool:
     return _get_best_model() is not None
 
 
-def _generate(prompt: str, max_length: int = 200) -> str | None:
+def _generate(
+    prompt: str, 
+    max_length: int = 200, 
+    task_type: str = "comment",
+    image_url: str | None = None
+) -> str | None:
     """
-    Core function — auto model selection।
-    सब public functions यही use करते हैं।
+    Enhanced core function:
+    - Multi-model routing
+    - Multimodal support (images)
+    - Semantic deduplication
+    - Safety filter handling
     """
-    model_id = _get_best_model()
+    model_id = _get_best_model(task_type)
     if not model_id:
-        logger.warning("No Gemini model available.")
         return None
 
     client = _get_client()
     if not client:
         return None
 
+    # Semantic Deduplication: Add history to prompt to avoid repetition
+    recent = get_recent_replies(5)
+    history_context = ""
+    if recent:
+        history_context = "\nRecent replies (DO NOT REPEAT THESE): " + " | ".join(recent)
+
+    # Multimodal: Handle Image if provided
+    contents = [prompt + history_context]
+    if image_url and model_id != "gemma-4-27b": # Gemma doesn't support images usually
+        try:
+            import requests
+            img_data = requests.get(image_url).content
+            contents.append(types.Part.from_bytes(data=img_data, mime_type="image/jpeg"))
+        except Exception as e:
+            logger.warning(f"Failed to load image for multimodal: {e}")
+
     try:
+        # Safety Config: Relaxed for religious context if high-quality model
+        config = types.GenerateContentConfig(
+            max_output_tokens=max_length,
+            safety_settings=[
+                types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+                types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+            ] if model_id == "gemini-2.5-flash" else None
+        )
+
         resp = client.models.generate_content(
             model=model_id,
-            contents=prompt,
+            contents=contents,
+            config=config
         )
+        
         set_state("consecutive_429s", "0")
         _record_call(model_id)
 
         text = (resp.text or "").strip()
-        return text[:max_length] if text else None
+        if text:
+            add_recent_reply(text)
+            return text[:max_length]
+        return None
 
     except Exception as e:
-        logger.error(f"Gemini error ({model_id}): {e}")
+        error_msg = str(e)
+        logger.error(f"Gemini error ({model_id}): {error_msg}")
+        
+        # Cooldown on 429
+        if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+            set_model_cooldown(model_id, 15)
+        
         _handle_gemini_error(e, model_id)
         return None
 
 
 # ── Public Functions ───────────────────────────────────
 
-def generate_reply(comment_text: str, post_caption: str = "") -> str | None:
+def generate_reply(comment_text: str, post_caption: str = "", image_url: str | None = None) -> str | None:
     if not can_use_gemini():
         return None
 
     context = f"\nPost Caption: {post_caption[:150]}" if post_caption else ""
+    visual_instr = "\nLook at the post image to make your reply specific to the content." if image_url else ""
+    
     prompt = (
         "You are @krishna.verse.ai — devotional Krishna Instagram page. "
         "Reply to this comment with warmth and spiritual love. "
         "SHORT (max 12 words), natural. "
         "End with 'Radhe Radhe 🙏' or 'Jai Shri Krishna ✨'. "
         "Never say you're an AI. Match comment language."
+        f"{visual_instr}"
         f"{context}"
         f"\nComment: {comment_text}"
     )
-    result = _generate(prompt, max_length=200)
+    result = _generate(prompt, max_length=200, task_type="comment", image_url=image_url)
     if result:
         result = result.replace('"', "").replace("'", "")
     return result
@@ -240,7 +310,7 @@ def generate_dm_reply(message_text: str) -> str | None:
         "Match language (Hindi or English)."
         f"\nMessage: {message_text}"
     )
-    return _generate(prompt, max_length=300)
+    return _generate(prompt, max_length=300, task_type="dm")
 
 
 def generate_welcome_dm(username: str) -> str | None:
@@ -253,7 +323,7 @@ def generate_welcome_dm(username: str) -> str | None:
         "Personal, spiritual, 2-3 emojis. "
         "End with Radhe Radhe 🙏. Don't mention AI."
     )
-    return _generate(prompt, max_length=400)
+    return _generate(prompt, max_length=400, task_type="dm")
 
 
 def is_spam_or_negative(text: str) -> bool:
@@ -268,7 +338,7 @@ def is_spam_or_negative(text: str) -> bool:
         "Reply with ONE word only: SPAM, NEGATIVE, or SAFE\n"
         f"Comment: {text}"
     )
-    result = _generate(prompt, max_length=10)
+    result = _generate(prompt, max_length=10, task_type="spam")
     return (result or "").strip().upper() in ("SPAM", "NEGATIVE")
 
 

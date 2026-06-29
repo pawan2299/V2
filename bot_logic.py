@@ -12,7 +12,7 @@ from gemini_client import (
     generate_dm_reply, generate_welcome_dm,
     is_spam_or_negative,
 )
-from instagram_api import reply_to_comment, send_dm
+from instagram_api import reply_to_comment, send_dm, get_media_url
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,12 @@ def handle_comment(comment_data: dict):
         reply_type = comment_type
 
         if comment_type == "ai" and use_ai:
-            reply = generate_reply(text)
+            # Fetch visual context if available
+            media_id = comment_data.get("media_id")
+            image_url = get_media_url(media_id) if media_id else None
+            
+            # Note: We can also pass post_caption here if we had it in comment_data
+            reply = generate_reply(text, image_url=image_url)
 
         if reply is None:
             if comment_type == "greeting":

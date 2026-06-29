@@ -41,6 +41,25 @@ def send_dm(user_id: str, message: str) -> bool:
     )
 
 
+def get_media_url(media_id: str) -> str | None:
+    """Fetch the image/video URL for a specific post."""
+    try:
+        resp = requests.get(
+            f"{BASE}/{media_id}",
+            params={
+                "fields": "media_url,permalink",
+                "access_token": SETTINGS.ig_user_token
+            },
+            timeout=TIMEOUT
+        )
+        if resp.ok:
+            return resp.json().get("media_url")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to fetch media_url: {e}")
+        return None
+
+
 def check_token_validity(token_type: str = "ig_user") -> bool:
     """
     Meta debug endpoint से token verify करो।

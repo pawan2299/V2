@@ -323,6 +323,38 @@ def get_gemini_count_today() -> int:
         return int(row["value"]) if row else 0
 
 
+def set_model_cooldown(model_id: str, duration_mins: int = 10):
+    until = (datetime.now(timezone.utc) + timedelta(minutes=duration_mins)).timestamp()
+    set_state(f"cooldown_{model_id}", str(until))
+
+
+def is_model_on_cooldown(model_id: str) -> bool:
+    until = get_state(f"cooldown_{model_id}")
+    if not until or until == "0":
+        return False
+    try:
+        return datetime.now(timezone.utc).timestamp() < float(until)
+    except ValueError:
+        return False
+
+
+def get_recent_replies(limit: int = 10) -> list[str]:
+    """Get text of recent replies to prevent semantic repetition."""
+    with get_db() as cur:
+        cur.execute("""
+            SELECT value FROM bot_state 
+            WHERE key LIKE 'last_reply_%%' 
+            ORDER BY key DESC LIMIT %s
+        """, (limit,))
+        return [row["value"] for row in cur.fetchall()]
+
+
+def add_recent_reply(text: str):
+    ts = datetime.now(timezone.utc).timestamp()
+    set_state(f"last_reply_{ts}", text)
+    # Optional: cleanup old ones periodically or just let them stay
+
+
 # ── Active Hours ───────────────────────────────────────
 
 def is_active_hours() -> bool:
